@@ -62,9 +62,14 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN must be set in .env for approval requests.")
 
 # Chat where approval requests should be sent (defaults to destination chat)
+# Can be a chat ID (number) or channel username (e.g., @channelname)
 APPROVAL_CHAT_ID_RAW = os.getenv("APPROVAL_CHAT_ID")
 if APPROVAL_CHAT_ID_RAW:
-    APPROVAL_CHAT_ID = int(APPROVAL_CHAT_ID_RAW)
+    # Check if it's a username (starts with @) or numeric ID
+    if APPROVAL_CHAT_ID_RAW.strip().startswith("@"):
+        APPROVAL_CHAT_ID = APPROVAL_CHAT_ID_RAW.strip()  # Keep as username
+    else:
+        APPROVAL_CHAT_ID = int(APPROVAL_CHAT_ID_RAW)  # Convert to int
 else:
     APPROVAL_CHAT_ID = FORWARD_TO_CHAT_ID
 
@@ -159,7 +164,8 @@ async def send_approval_request(
         "disable_web_page_preview": True,
         "reply_markup": json.dumps(keyboard),
     }
-    if APPROVAL_CHAT_ID == FORWARD_TO_CHAT_ID and FORWARD_TO_THREAD_ID:
+    # Only add thread_id if approval chat is the same as forward chat (and thread_id exists)
+    if isinstance(APPROVAL_CHAT_ID, int) and APPROVAL_CHAT_ID == FORWARD_TO_CHAT_ID and FORWARD_TO_THREAD_ID:
         params["message_thread_id"] = FORWARD_TO_THREAD_ID
 
     try:
