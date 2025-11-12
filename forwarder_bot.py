@@ -721,7 +721,13 @@ def build_application() -> Application:
 
     builder = ApplicationBuilder().token(BOT_TOKEN)
     if AIORateLimiter:
-        builder = builder.rate_limiter(AIORateLimiter())
+        try:
+            builder = builder.rate_limiter(AIORateLimiter())
+        except RuntimeError as e:
+            logger.warning(
+                "AIORateLimiter initialization failed: %s. Continuing without rate limiter.",
+                e,
+            )
     else:
         logger.warning(
             "AIORateLimiter not available. Install python-telegram-bot[rate-limiter] "
