@@ -261,6 +261,50 @@ systemctl status tg-forwarder
 
 ---
 
+## Update .env File After Deployment
+
+**Important:** After changing any values in `.env`, you **must restart the service** for changes to take effect!
+
+### Steps:
+
+1. **Edit your `.env` file:**
+   ```bash
+   cd ~/whop-update
+   nano .env
+   ```
+   
+   Make your changes (e.g., update `APPROVAL_CHAT_ID`, `WEBHOOK_URL`, etc.)
+
+2. **Save the file:**
+   - `Ctrl + X`, then `Y`, then `Enter`
+
+3. **Restart the service:**
+   ```bash
+   systemctl restart tg-forwarder
+   ```
+
+4. **Verify it's running:**
+   ```bash
+   systemctl status tg-forwarder
+   ```
+
+5. **Check logs to confirm:**
+   ```bash
+   journalctl -u tg-forwarder -f
+   ```
+
+### Common .env Changes:
+
+- **Changing `APPROVAL_CHAT_ID`** → Restart required
+- **Changing `WEBHOOK_URL`** → Restart required
+- **Changing `APPROVER_IDS`** → Restart required
+- **Changing `LOG_LEVEL`** → Restart required
+- **Any environment variable** → Restart required
+
+**Note:** The service reads `.env` file only when it starts, so changes won't take effect until you restart!
+
+---
+
 ## Monitor in Production
 
 ### Set Up Log Rotation (Optional but Recommended)
