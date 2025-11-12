@@ -156,31 +156,63 @@ async def send_approval_request(
         ]
     }
 
+    # Resolve channel username to ID if needed
+    approval_chat_id = APPROVAL_CHAT_ID
+    if isinstance(APPROVAL_CHAT_ID, str) and APPROVAL_CHAT_ID.startswith("@"):
+        # Try to get channel ID from username
+        try:
+            channel_entity = await client.get_entity(APPROVAL_CHAT_ID)
+            approval_chat_id = channel_entity.id
+            logger.info(
+                "Resolved channel username %s to ID %s",
+                APPROVAL_CHAT_ID,
+                approval_chat_id,
+            )
+        except Exception as resolve_exc:
+            logger.error(
+                "Failed to resolve channel username %s: %s. Trying username directly.",
+                APPROVAL_CHAT_ID,
+                resolve_exc,
+            )
+            # Keep the username as-is and let Telegram API handle it
+            approval_chat_id = APPROVAL_CHAT_ID
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     params = {
-        "chat_id": APPROVAL_CHAT_ID,
+        "chat_id": approval_chat_id,
         "text": preview,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "reply_markup": json.dumps(keyboard),
     }
     # Only add thread_id if approval chat is the same as forward chat (and thread_id exists)
-    if isinstance(APPROVAL_CHAT_ID, int) and APPROVAL_CHAT_ID == FORWARD_TO_CHAT_ID and FORWARD_TO_THREAD_ID:
+    if isinstance(approval_chat_id, int) and approval_chat_id == FORWARD_TO_CHAT_ID and FORWARD_TO_THREAD_ID:
         params["message_thread_id"] = FORWARD_TO_THREAD_ID
 
     try:
+        logger.info(
+            "Attempting to send approval request to chat_id=%s (original=%s)",
+            approval_chat_id,
+            APPROVAL_CHAT_ID,
+        )
         response = requests.post(url, json=params, timeout=10)
         response.raise_for_status()
         logger.info(
             "✅ Approval request sent successfully for message id=%s to chat=%s thread=%s",
             original_message_id,
-            APPROVAL_CHAT_ID,
-            FORWARD_TO_THREAD_ID if APPROVAL_CHAT_ID == FORWARD_TO_CHAT_ID else None,
+            approval_chat_id,
+            FORWARD_TO_THREAD_ID if isinstance(approval_chat_id, int) and approval_chat_id == FORWARD_TO_CHAT_ID else None,
         )
     except Exception as exc:
         logger.exception("❌ Failed to send approval request: %s", exc)
         if 'response' in locals():
-            logger.error("Response: %s", response.text)
+            logger.error("Response status: %s", response.status_code)
+            logger.error("Response body: %s", response.text)
+            try:
+                error_data = response.json()
+                logger.error("Error details: %s", error_data)
+            except:
+                pass
 
 
 async def process_channel_message(event) -> None:
