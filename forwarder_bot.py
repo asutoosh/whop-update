@@ -593,24 +593,38 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query:
         return
 
+    logger.info(
+        "Callback query received: from_user=%s, chat=%s, data=%s",
+        query.from_user.id if query.from_user else None,
+        query.message.chat.id if query.message else None,
+        query.data,
+    )
+
     user_id = query.from_user.id if query.from_user else None
     if not require_approver(user_id):
+        logger.warning("User %s is not in APPROVER_IDS list", user_id)
         await query.answer("You are not allowed to approve forwards.", show_alert=True)
         return
 
     if not query.data:
+        logger.warning("Callback query has no data")
         await query.answer()
         return
 
     action, _, key = query.data.partition("|")
+    logger.info("Processing callback: action=%s, key=%s", action, key)
+    
     pending_store = get_pending_store(context)
     pending = pending_store.get(key)
+    
+    logger.info("Pending store lookup: key=%s, found=%s", key, pending is not None)
 
     # If pending not found, try to extract formatted text from the approval message itself
     if not pending:
-        logger.warning("Pending forward not found for key=%s, trying to extract from message", key)
+        logger.info("Pending forward not found for key=%s, trying to extract from message", key)
         approval_msg = query.message
         if approval_msg and approval_msg.text:
+            logger.info("Extracting text from approval message: %s", approval_msg.text[:200])
             # Extract the formatted text from the HTML pre tag
             import re
             # Try to get HTML text - telegram library provides entities
