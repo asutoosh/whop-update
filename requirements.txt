@@ -1,0 +1,5 @@
+python-telegram-bot[rate-limiter]>=21.0
+telethon
+requests
+python-dotenv
+
