@@ -1,461 +1,513 @@
+# user_forwarder.py
 """
-Telethon-based userbot that watches a source channel, forwards messages to your group,
-and auto-forwards to Whop or requests approval via bot.
+Userbot watcher for signals:
+- Logs in as a Telegram user (Telethon) using API_ID/API_HASH/USERBOT_SESSION.
+- Watches SOURCE_CHANNEL for new messages.
+- For every text message:
+    1) Sends raw text to Freya ingest API (WEBSITE_API_URL + INGEST_API_KEY).
+    2) If ingest says status == 'success':
+        - Forwards formatted text to:
+            * FORWARD_TO_CHAT_ID + FORWARD_TO_THREAD_ID
+            * EXTRA_FORWARD_1_CHAT_ID + EXTRA_FORWARD_1_THREAD_ID
+            * EXTRA_FORWARD_2_CHAT_ID + EXTRA_FORWARD_2_THREAD_ID
+        - Sends payload to Whop WEBHOOK_URL.
 
-Usage:
-    1. pip install telethon python-dotenv requests
-    2. Fill in .env with:
-        API_ID=123456
-        API_HASH=your_api_hash
-        USERBOT_SESSION=user_forwarder  # optional session file name
-        SOURCE_CHANNEL=@wazirforexalerts  # channel username or ID to watch
-        FORWARD_TO_CHAT_ID=-1001234567890  # destination supergroup id
-        FORWARD_TO_THREAD_ID=7              # forum topic id
-        BOT_TOKEN=...                       # bot token for approval requests
-        WHOP_WEBHOOK_URL=...                # optional override; falls back to WEBHOOK_URL
-    3. Run: python user_forwarder.py
-    4. Follow the login prompt (code sent by Telegram).
+Uses the same .env you posted.
 """
-
-from __future__ import annotations
 
 import asyncio
-import html
+import json
 import logging
 import os
-from typing import Optional, Tuple, Union, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import ChannelInvalidError, ChannelPrivateError
 from telethon.tl.functions.channels import JoinChannelRequest
 
-import forwarder_bot as formatter
+# ---------------------------------------------------------------------------
+# Env & logging
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-SESSION_NAME = os.getenv("USERBOT_SESSION", "user_forwarder")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+SESSION_NAME = os.getenv("USERBOT_SESSION", "user_forwarder").strip()
 
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL")  # Channel username or ID
-FORWARD_TO_CHAT_ID_RAW = os.getenv("FORWARD_TO_CHAT_ID")
-FORWARD_TO_THREAD_ID_RAW = os.getenv("FORWARD_TO_THREAD_ID")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 
-if not API_ID or not API_HASH:
-    raise RuntimeError("API_ID and API_HASH must be set in .env (obtain from my.telegram.org).")
+FORWARD_TO_CHAT_ID = os.getenv("FORWARD_TO_CHAT_ID", "").strip()
+FORWARD_TO_THREAD_ID = os.getenv("FORWARD_TO_THREAD_ID", "").strip()
 
-if not SOURCE_CHANNEL:
-    raise RuntimeError("SOURCE_CHANNEL must be set in .env (e.g., @wazirforexalerts).")
+EXTRA_FORWARD_1_CHAT_ID = os.getenv("EXTRA_FORWARD_1_CHAT_ID", "").strip()
+EXTRA_FORWARD_1_THREAD_ID = os.getenv("EXTRA_FORWARD_1_THREAD_ID", "").strip()
+EXTRA_FORWARD_2_CHAT_ID = os.getenv("EXTRA_FORWARD_2_CHAT_ID", "").strip()
+EXTRA_FORWARD_2_THREAD_ID = os.getenv("EXTRA_FORWARD_2_THREAD_ID", "").strip()
 
-if not FORWARD_TO_CHAT_ID_RAW:
-    raise RuntimeError("FORWARD_TO_CHAT_ID must be set in .env (destination group ID).")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-def convert_to_bot_api_id(telethon_id: int) -> int:
-    """
-    Convert Telethon ID to Bot API format.
-    For supergroups/channels: -100 + ID
-    For regular groups: -ID
-    For channels: -100 + ID
-    """
-    if telethon_id > 0:
-        # Positive ID means it's a supergroup/channel, convert to -100xxxxxxxxxx format
-        return int(f"-100{telethon_id}")
-    # Already negative, return as-is
-    return telethon_id
+APPROVAL_CHAT_ID = os.getenv("APPROVAL_CHAT_ID", "").strip()
 
-FORWARD_TO_CHAT_ID_RAW_INT = int(FORWARD_TO_CHAT_ID_RAW)
-# Convert to Bot API format if it's a positive ID (Telethon format)
-if FORWARD_TO_CHAT_ID_RAW_INT > 0:
-    FORWARD_TO_CHAT_ID: int = convert_to_bot_api_id(FORWARD_TO_CHAT_ID_RAW_INT)
-else:
-    FORWARD_TO_CHAT_ID: int = FORWARD_TO_CHAT_ID_RAW_INT  # Already in Bot API format
-
-FORWARD_TO_THREAD_ID: Optional[int] = (
-    int(FORWARD_TO_THREAD_ID_RAW) if FORWARD_TO_THREAD_ID_RAW else None
+WEBHOOK_URL = os.getenv("WHOP_WEBHOOK_URL", "").strip() or os.getenv(
+    "WEBHOOK_URL", ""
+).strip()
+WEBHOOK_SEND_MODE = os.getenv("WEBHOOK_SEND_MODE", "json").strip().lower()
+WEBHOOK_PAYLOAD_KEY = os.getenv("WEBHOOK_PAYLOAD_KEY", "text").strip()
+WEBHOOK_INCLUDE_META = os.getenv("WEBHOOK_INCLUDE_META", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
 )
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN must be set in .env for approval requests.")
+WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "").strip()
+WEBHOOK_SIGNATURE_HEADER = os.getenv(
+    "WEBHOOK_SIGNATURE_HEADER", "X-Webhook-Signature"
+).strip()
+ALLOW_INSECURE_WEBHOOK = os.getenv("ALLOW_INSECURE_WEBHOOK", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-# Chat where approval requests should be sent (defaults to destination chat)
-# Can be a chat ID (number) or channel username (e.g., @channelname)
-APPROVAL_CHAT_ID_RAW = os.getenv("APPROVAL_CHAT_ID")
-if APPROVAL_CHAT_ID_RAW:
-    # Check if it's a username (starts with @) or numeric ID
-    if APPROVAL_CHAT_ID_RAW.strip().startswith("@"):
-        APPROVAL_CHAT_ID = APPROVAL_CHAT_ID_RAW.strip()  # Keep as username
-    else:
-        raw_id = int(APPROVAL_CHAT_ID_RAW)
-        # Convert to Bot API format if it's a positive ID (Telethon format)
-        if raw_id > 0:
-            APPROVAL_CHAT_ID = convert_to_bot_api_id(raw_id)
-        else:
-            APPROVAL_CHAT_ID = raw_id  # Already in Bot API format
-else:
-    APPROVAL_CHAT_ID = FORWARD_TO_CHAT_ID
+ALLOWED_CHAT_IDS_RAW = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+ALLOWED_TOPICS_RAW = os.getenv("ALLOWED_TOPICS", "").strip()
+REQUIRE_FORWARDED = os.getenv("REQUIRE_FORWARDED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-WEBHOOK_URL_OVERRIDE = os.getenv("WHOP_WEBHOOK_URL")
-if WEBHOOK_URL_OVERRIDE:
-    formatter.WEBHOOK_URL = WEBHOOK_URL_OVERRIDE
+INCLUDE_SCRIPT_LINE = os.getenv("INCLUDE_SCRIPT_LINE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 LOG_LEVEL = os.getenv("USERBOT_LOG_LEVEL", "INFO").upper()
+
+WEBSITE_API_URL = os.getenv("WEBSITE_API_URL", "").strip()
+INGEST_API_KEY = os.getenv("INGEST_API_KEY", "").strip()
+
+FORWARD_STATE_FILE = "forward_state.json"
+
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelname)s:%(name)s:%(message)s",
 )
 logger = logging.getLogger("user_forwarder")
 
+if not API_ID or not API_HASH:
+    raise SystemExit("❌ API_ID and API_HASH are required in .env")
 
-PayloadType = Union[Dict[str, Optional[str]], str]
+if not SOURCE_CHANNEL:
+    raise SystemExit("❌ SOURCE_CHANNEL is required in .env")
+
+if not BOT_TOKEN:
+    logger.warning("BOT_TOKEN is not set – forwarding to Telegram groups will not work.")
+
+# ---------------------------------------------------------------------------
+# Helpers: parse IDs, allowed lists
+# ---------------------------------------------------------------------------
 
 
-def build_formatted_payload(text: str) -> Optional[Tuple[str, PayloadType]]:
-    cleaned = formatter.remove_banned(text)
-    if not cleaned:
-        logger.info("Message cleaned to empty content; skipping.")
+def _parse_int_or_none(value: str) -> Optional[int]:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
         return None
 
-    status_only_override = formatter.is_status_only_message(cleaned)
-    if status_only_override:
-        formatted_text = cleaned.strip()
-    else:
-        trade = formatter.parse_trade(cleaned)
-        formatted_text = formatter.build_formatted(trade, cleaned)
 
-    payload = formatter.build_webhook_payload(formatted_text, meta=None)
-    return formatted_text, payload
+def _parse_chat_id_list(raw: str) -> List[int]:
+    if not raw:
+        return []
+    out: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        v = _parse_int_or_none(part)
+        if v is not None:
+            out.append(v)
+    return out
 
 
-def should_auto_forward(cleaned: str, trade: formatter.TradeInfo) -> bool:
-    """Check if message matches known formats for auto-forwarding."""
-    # Check for status-only messages (Position Status, Take Profit X From..., etc.)
-    if formatter.is_status_only_message(cleaned):
+def _parse_topics(raw: str) -> List[Tuple[int, int]]:
+    """
+    Format: chat_id:thread_id,chat_id:thread_id
+    """
+    if not raw:
+        return []
+    out: List[Tuple[int, int]] = []
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            continue
+        chat_str, thread_str = pair.split(":", 1)
+        chat_id = _parse_int_or_none(chat_str)
+        thread_id = _parse_int_or_none(thread_str)
+        if chat_id is not None and thread_id is not None:
+            out.append((chat_id, thread_id))
+    return out
+
+
+ALLOWED_CHAT_IDS = _parse_chat_id_list(ALLOWED_CHAT_IDS_RAW)
+ALLOWED_TOPICS = _parse_topics(ALLOWED_TOPICS_RAW)
+
+MAIN_CHAT_ID = _parse_int_or_none(FORWARD_TO_CHAT_ID)  # supergroup
+MAIN_THREAD_ID = _parse_int_or_none(FORWARD_TO_THREAD_ID)
+
+EXTRA1_CHAT_ID = _parse_int_or_none(EXTRA_FORWARD_1_CHAT_ID)
+EXTRA1_THREAD_ID = _parse_int_or_none(EXTRA_FORWARD_1_THREAD_ID)
+EXTRA2_CHAT_ID = _parse_int_or_none(EXTRA_FORWARD_2_CHAT_ID)
+EXTRA2_THREAD_ID = _parse_int_or_none(EXTRA_FORWARD_2_THREAD_ID)
+
+APPROVAL_CHAT_ID_INT = _parse_int_or_none(APPROVAL_CHAT_ID)
+
+# ---------------------------------------------------------------------------
+# Shared forwarding state (same as forwarder_bot.py)
+# ---------------------------------------------------------------------------
+
+
+def is_forwarding_enabled() -> bool:
+    try:
+        with open(FORWARD_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return bool(data.get("enabled", True))
+    except FileNotFoundError:
         return True
-    
-    # Also check for status patterns in the text
-    lower_cleaned = cleaned.lower()
-    status_patterns = [
-        "position status",
-        "take profit",
-        "hit tp",
-        "hit sl",
-        "from long signal",
-        "from short signal",
-    ]
-    if any(pattern in lower_cleaned for pattern in status_patterns):
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", FORWARD_STATE_FILE, exc)
         return True
 
-    # Check for full trade format: must have Position AND Enter Price
-    has_position = bool(trade.position)
-    has_enter = bool(trade.enter)
-    
-    # Also check text directly for these keywords
-    has_position_text = "position" in lower_cleaned
-    has_enter_text = "enter price" in lower_cleaned or "enter" in lower_cleaned
-    
-    # Auto-forward if we have both position and enter (either parsed or in text)
-    return (has_position and has_enter) or (has_position_text and has_enter_text)
+
+# ---------------------------------------------------------------------------
+# Freya ingest API
+# ---------------------------------------------------------------------------
 
 
-async def send_approval_request(
-    client: TelegramClient, formatted_text: str, original_message_id: int
-) -> None:
-    """Send approval request via bot to the destination group/topic."""
-    import json
+def call_freya_ingest(message_text: str) -> Dict[str, Any]:
+    """
+    Send raw text to Freya ingest API.
+    Returns dict: {success, status, data}
+    """
+    if not WEBSITE_API_URL or not INGEST_API_KEY:
+        logger.debug("Freya ingest not configured, skipping.")
+        return {"success": False, "status": "not_configured", "data": None}
 
-    key = f"{FORWARD_TO_CHAT_ID}:{original_message_id}"
-    escaped = html.escape(formatted_text)
-    preview = f"Ready to forward this message?\n\n<pre>{escaped}</pre>"
-    preview = preview[:4000]
-
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "Allow Forward ✅", "callback_data": f"allow|{key}"},
-                {"text": "Deny 🚫", "callback_data": f"deny|{key}"},
-            ]
-        ]
+    url = WEBSITE_API_URL.rstrip("/") + "/api/signals/ingest"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {INGEST_API_KEY}",
     }
-
-    # Resolve channel username to ID if needed
-    approval_chat_id = APPROVAL_CHAT_ID
-    if isinstance(APPROVAL_CHAT_ID, str) and APPROVAL_CHAT_ID.startswith("@"):
-        # Try to get channel ID from username
-        try:
-            channel_entity = await client.get_entity(APPROVAL_CHAT_ID)
-            telethon_id = channel_entity.id
-            # Convert Telethon ID to Bot API format
-            approval_chat_id = convert_to_bot_api_id(telethon_id) if telethon_id > 0 else telethon_id
-            logger.info(
-                "Resolved channel username %s to ID %s (Bot API format: %s)",
-                APPROVAL_CHAT_ID,
-                telethon_id,
-                approval_chat_id,
-            )
-        except Exception as resolve_exc:
-            logger.error(
-                "Failed to resolve channel username %s: %s. Trying username directly.",
-                APPROVAL_CHAT_ID,
-                resolve_exc,
-            )
-            # Keep the username as-is and let Telegram API handle it
-            approval_chat_id = APPROVAL_CHAT_ID
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    params = {
-        "chat_id": approval_chat_id,
-        "text": preview,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": json.dumps(keyboard),
-    }
-    # Only add thread_id if approval chat is the same as forward chat (and thread_id exists)
-    if isinstance(approval_chat_id, int) and approval_chat_id == FORWARD_TO_CHAT_ID and FORWARD_TO_THREAD_ID:
-        params["message_thread_id"] = FORWARD_TO_THREAD_ID
+    payload = {"message": message_text}
 
     try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw_text": resp.text[:200]}
+
+        status_field = data.get("status", "unknown")
         logger.info(
-            "Attempting to send approval request to chat_id=%s (original=%s)",
-            approval_chat_id,
-            APPROVAL_CHAT_ID,
+            "Freya ingest response: http=%s, status=%s",
+            resp.status_code,
+            status_field,
         )
-        response = requests.post(url, json=params, timeout=10)
-        response.raise_for_status()
-        logger.info(
-            "✅ Approval request sent successfully for message id=%s to chat=%s thread=%s",
-            original_message_id,
-            approval_chat_id,
-            FORWARD_TO_THREAD_ID if isinstance(approval_chat_id, int) and approval_chat_id == FORWARD_TO_CHAT_ID else None,
-        )
+        return {
+            "success": resp.status_code == 200,
+            "status": status_field,
+            "data": data,
+        }
     except Exception as exc:
-        logger.exception("❌ Failed to send approval request: %s", exc)
-        if 'response' in locals():
-            logger.error("Response status: %s", response.status_code)
-            logger.error("Response body: %s", response.text)
-            try:
-                error_data = response.json()
-                logger.error("Error details: %s", error_data)
-            except:
-                pass
+        logger.exception("❌ Freya ingest request failed: %s", exc)
+        return {"success": False, "status": "error", "data": None}
+
+
+def build_signal_text(signal: Dict[str, Any], fallback_text: str) -> str:
+    """
+    Build a human-readable message for Telegram groups from Freya 'signal' object.
+    Falls back to raw text if needed.
+    Expected fields (if Freya returns them): script, position, entry, takeProfits, stopLoss, etc.
+    """
+    if not signal:
+        return fallback_text
+
+    script = signal.get("script") or "Unknown"
+    direction = signal.get("position") or signal.get("side") or ""
+    entry = signal.get("entry") or signal.get("enter_price") or signal.get("entryPrice")
+    tps = signal.get("takeProfits") or signal.get("tps") or []
+    sl = signal.get("stopLoss") or signal.get("sl")
+
+    lines = []
+
+    if INCLUDE_SCRIPT_LINE:
+        lines.append(f"<b>{script}</b>")
+
+    if direction:
+        lines.append(f"Position: <b>{direction}</b>")
+    if entry:
+        lines.append(f"Entry: <code>{entry}</code>")
+
+    if isinstance(tps, list) and tps:
+        for idx, tp in enumerate(tps, start=1):
+            lines.append(f"TP{idx}: <code>{tp}</code>")
+    elif isinstance(tps, dict):
+        for key, val in tps.items():
+            lines.append(f"{key}: <code>{val}</code>")
+
+    if sl:
+        lines.append(f"SL: <code>{sl}</code>")
+
+    if not lines:
+        return fallback_text
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Telegram Bot API sending (forwards to groups/topics)
+# ---------------------------------------------------------------------------
+
+
+def send_telegram_message(
+    chat_id: int,
+    text: str,
+    thread_id: Optional[int] = None,
+    parse_mode: str = "HTML",
+) -> None:
+    if not BOT_TOKEN:
+        logger.warning(
+            "BOT_TOKEN not set, cannot forward to Telegram chat_id=%s", chat_id
+        )
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(
+                "sendMessage failed for chat_id=%s: http=%s body=%s",
+                chat_id,
+                resp.status_code,
+                resp.text[:200],
+            )
+        else:
+            logger.info(
+                "Forwarded to chat_id=%s thread_id=%s", chat_id, thread_id
+            )
+    except Exception as exc:
+        logger.exception("Error sending Telegram message: %s", exc)
+
+
+def forward_to_all_destinations(formatted_text: str) -> None:
+    """
+    Forward formatted signal text to:
+    - main group/topic
+    - extra topic 1
+    - extra topic 2
+    """
+    if MAIN_CHAT_ID:
+        send_telegram_message(MAIN_CHAT_ID, formatted_text, MAIN_THREAD_ID)
+
+    if EXTRA1_CHAT_ID:
+        send_telegram_message(EXTRA1_CHAT_ID, formatted_text, EXTRA1_THREAD_ID)
+
+    if EXTRA2_CHAT_ID:
+        send_telegram_message(EXTRA2_CHAT_ID, formatted_text, EXTRA2_THREAD_ID)
+
+
+# ---------------------------------------------------------------------------
+# Whop / webhook sending
+# ---------------------------------------------------------------------------
+
+
+def send_whop_webhook(
+    formatted_text: str,
+    signal: Optional[Dict[str, Any]],
+    raw_text: str,
+) -> None:
+    if not WEBHOOK_URL:
+        logger.debug("WEBHOOK_URL not set, skipping webhook.")
+        return
+
+    # Build payload
+    if WEBHOOK_SEND_MODE == "json":
+        payload: Any = {WEBHOOK_PAYLOAD_KEY: formatted_text}
+        if WEBHOOK_INCLUDE_META:
+            payload["meta"] = {
+                "raw_text": raw_text,
+                "signal": signal or {},
+            }
+        headers = {"Content-Type": "application/json"}
+        data_to_send = payload
+    elif WEBHOOK_SEND_MODE == "form":
+        payload = {WEBHOOK_PAYLOAD_KEY: formatted_text}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data_to_send = payload
+    else:  # "text"
+        payload = formatted_text
+        headers = {"Content-Type": "text/plain"}
+        data_to_send = payload
+
+    # Basic optional signature – if you want to implement HMAC on receiver side.
+    if WEBHOOK_SHARED_SECRET:
+        # Very simple signature: length+secret; replace with HMAC if you want.
+        sig = f"{len(formatted_text)}:{WEBHOOK_SHARED_SECRET}"
+        headers[WEBHOOK_SIGNATURE_HEADER] = sig
+
+    if WEBHOOK_URL.startswith("http://") and not ALLOW_INSECURE_WEBHOOK:
+        logger.warning("HTTP webhook blocked (ALLOW_INSECURE_WEBHOOK=false). URL=%s", WEBHOOK_URL)
+        return
+
+    try:
+        if WEBHOOK_SEND_MODE == "json":
+            resp = requests.post(WEBHOOK_URL, json=data_to_send, headers=headers, timeout=10)
+        elif WEBHOOK_SEND_MODE == "form":
+            resp = requests.post(WEBHOOK_URL, data=data_to_send, headers=headers, timeout=10)
+        else:
+            resp = requests.post(WEBHOOK_URL, data=data_to_send, headers=headers, timeout=10)
+
+        if resp.status_code >= 400:
+            logger.warning(
+                "Webhook call failed: http=%s body=%s",
+                resp.status_code,
+                resp.text[:200],
+            )
+        else:
+            logger.info("Webhook sent successfully (status %s)", resp.status_code)
+    except Exception as exc:
+        logger.exception("Error sending webhook: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Core message processing
+# ---------------------------------------------------------------------------
 
 
 async def process_channel_message(event) -> None:
-    """Process a message from the source channel: forward to group only if auto-forwardable, then handle Whop."""
     message = event.message
-    text = message.message
+    text = message.message or ""
+    chat_id = event.chat_id
+
     logger.info(
-        "Processing message id=%s from chat_id=%s, has_text=%s",
+        "New channel message: id=%s chat_id=%s has_text=%s",
         message.id,
-        event.chat_id,
-        bool(text),
-    )
-    if text:
-        logger.info("Raw message text (first 500 chars): %s", text[:500])
-    if not text:
-        logger.info("Skipping message id=%s (no text content)", message.id)
-        return
-
-    # Step 1: Process for Whop and check if should auto-forward
-    result = build_formatted_payload(text)
-    if not result:
-        logger.info("Skipping message id=%s (cleaned to empty)", message.id)
-        return
-
-    formatted_text, payload = result
-
-    # Step 2: Check if should auto-forward or request approval
-    cleaned = formatter.remove_banned(text)
-    trade = formatter.parse_trade(cleaned)
-    auto_forward = should_auto_forward(cleaned, trade)
-    
-    logger.info(
-        "Message id=%s: auto_forward=%s, has_position=%s, has_enter=%s, is_status_only=%s",
-        message.id,
-        auto_forward,
-        bool(trade.position),
-        bool(trade.enter),
-        formatter.is_status_only_message(cleaned),
+        chat_id,
+        bool(text.strip()),
     )
 
-    if auto_forward:
-        # Step 3a: Auto-forwardable messages → forward to subtopic AND send to Whop
-        forwarded_msg = None
-        try:
-            # Use Bot API to send to topic (supports message_thread_id directly)
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            params = {
-                "chat_id": FORWARD_TO_CHAT_ID,
-                "text": text,  # Send original text
-            }
-            if FORWARD_TO_THREAD_ID:
-                params["message_thread_id"] = FORWARD_TO_THREAD_ID
-            
-            response = requests.post(url, json=params, timeout=10)
-            response.raise_for_status()
-            result = response.json()
-            if result.get("ok"):
-                forwarded_msg_id = result["result"]["message_id"]
-                # Create a mock message object for compatibility
-                class MockMessage:
-                    def __init__(self, msg_id):
-                        self.id = msg_id
-                forwarded_msg = MockMessage(forwarded_msg_id)
-                
-                logger.info(
-                    "✅ Sent message id=%s from channel to chat=%s thread=%s (bot API)",
-                    message.id,
-                    FORWARD_TO_CHAT_ID,
-                    FORWARD_TO_THREAD_ID,
-                )
-            else:
-                raise Exception(f"Bot API error: {result.get('description', 'Unknown error')}")
-        except Exception as exc:
-            logger.exception("Failed to send message to group via bot API: %s", exc)
-            # Try fallback: use Telethon to forward (won't go to topic but at least it's forwarded)
-            try:
-                forwarded_msgs = await event.client.forward_messages(
-                    FORWARD_TO_CHAT_ID,
-                    message,
-                    from_peer=event.chat_id,
-                )
-                forwarded_msg = forwarded_msgs[0] if forwarded_msgs else None
-                logger.warning("Used fallback forward via Telethon (may not be in correct topic)")
-            except Exception as fallback_exc:
-                logger.exception("Fallback forward also failed: %s", fallback_exc)
-                # Continue anyway to try webhook
+    if not text.strip():
+        logger.info("Skipping message id=%s (no text).", message.id)
+        return
 
-        # Step 4a: Auto-forward to Whop
-        logger.info("Auto-forwarding message id=%s to Whop", message.id)
-        logger.info("Formatted text being sent:\n%s", formatted_text)
-        logger.info("Payload being sent: %s", payload)
-        try:
-            response = formatter.post_to_webhook(payload, formatted_text)
-        except Exception as exc:
-            logger.exception("Webhook post failed: %s", exc)
-            logger.info("Falling back to approval request due to webhook error")
-            if forwarded_msg:
-                await send_approval_request(event.client, formatted_text, forwarded_msg.id)
-            return
-
-        logger.info("Webhook response: status=%s, body=%s", response.status_code, response.text[:500])
-        if response.status_code >= 400:
-            error_msg = response.text.strip() or f"HTTP {response.status_code}"
-            logger.error(
-                "Webhook HTTP %s: %s (URL: %s)", 
-                response.status_code, 
-                error_msg,
-                formatter.WEBHOOK_URL
-            )
-            logger.info("Falling back to approval request due to webhook error")
-            if forwarded_msg:
-                await send_approval_request(event.client, formatted_text, forwarded_msg.id)
-            return
-
+    # Filters (optional, based on env)
+    if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
         logger.info(
-            "✅ Auto-forwarded message id=%s to webhook status=%s",
+            "Skipping chat_id=%s (not in ALLOWED_CHAT_IDS %s)",
+            chat_id,
+            ALLOWED_CHAT_IDS,
+        )
+        return
+
+    if REQUIRE_FORWARDED and not (message.fwd_from or getattr(message, "forward", None)):
+        logger.info("Skipping message id=%s (REQUIRE_FORWARDED=true, not forwarded).", message.id)
+        return
+
+    if not is_forwarding_enabled():
+        logger.info("Forwarding disabled (forward_state.json), but still calling Freya ingest.")
+    else:
+        logger.info("Forwarding is currently enabled.")
+
+    # 1) Always send raw text to Freya ingest
+    ingest_result = call_freya_ingest(text)
+
+    # 2) If Freya says it's a valid signal, forward to destinations & webhook
+    is_valid_signal = ingest_result.get("success") and ingest_result.get("status") == "success"
+    signal_obj: Dict[str, Any] = (ingest_result.get("data") or {}).get("signal", {}) if ingest_result.get("data") else {}
+
+    if not is_forwarding_enabled():
+        logger.info(
+            "Forwarding disabled – not sending to Telegram groups or Whop, even if valid signal."
+        )
+        return
+
+    if is_valid_signal:
+        logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
+        formatted_text = build_signal_text(signal_obj, text)
+        # Forward to all Telegram destinations
+        forward_to_all_destinations(formatted_text)
+        # Send to Whop/webhook
+        send_whop_webhook(formatted_text, signal_obj, raw_text=text)
+    else:
+        logger.info(
+            "Message id=%s NOT classified as valid signal by Freya (status=%s).",
             message.id,
-            response.status_code,
+            ingest_result.get("status"),
         )
 
-        # Also forward refined text to any configured extra topics
-        try:
-            formatter.forward_to_additional_topics(formatted_text)
-        except Exception as exc:
-            logger.exception("Extra topic forwarding from user_forwarder failed: %s", exc)
-    else:
-        # Step 3b: Messages needing approval → DON'T forward to subtopic, ONLY send approval request
-        logger.info("Requesting approval for message id=%s (doesn't match auto-forward criteria, NOT forwarding to subtopic)", message.id)
-        # Use a dummy message ID for the approval request (since we're not forwarding)
-        dummy_msg_id = message.id  # Use channel message ID as reference
-        await send_approval_request(event.client, formatted_text, dummy_msg_id)
+
+# ---------------------------------------------------------------------------
+# Main Telethon client
+# ---------------------------------------------------------------------------
 
 
 async def main() -> None:
-    api_id = int(API_ID)
-    api_hash = API_HASH
+    print("=" * 60)
+    print("🚀 user_forwarder.py (Telethon userbot)")
+    print("=" * 60)
+    print(f"👤 Session: {SESSION_NAME}")
+    print(f"📺 Source channel: {SOURCE_CHANNEL}")
+    print(f"📡 Freya API: {WEBSITE_API_URL or 'not configured'}")
+    print(f"🔐 Ingest key set: {'yes' if INGEST_API_KEY else 'no'}")
+    print(f"🎯 Main group: {MAIN_CHAT_ID} thread={MAIN_THREAD_ID}")
+    print(f"🎯 Extra1: {EXTRA1_CHAT_ID} thread={EXTRA1_THREAD_ID}")
+    print(f"🎯 Extra2: {EXTRA2_CHAT_ID} thread={EXTRA2_THREAD_ID}")
+    print("=" * 60)
 
-    async with TelegramClient(SESSION_NAME, api_id, api_hash) as client:
-        # Verify we can access the channel
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+    async with client:
+        # Resolve and ensure we joined the channel
         try:
             channel_entity = await client.get_entity(SOURCE_CHANNEL)
-            logger.info(
-                "Channel entity resolved: id=%s, title=%s",
-                channel_entity.id,
-                getattr(channel_entity, "title", "N/A"),
-            )
-
             try:
-                logger.info("Attempting to join channel %s...", SOURCE_CHANNEL)
                 await client(JoinChannelRequest(channel_entity))
-                logger.info("Join channel request completed (or already a member).")
-            except Exception as join_exc:
-                logger.warning(
-                    "Join channel request failed (possibly already joined): %s",
-                    join_exc,
-                )
-        except Exception as exc:
-            logger.error(
-                "Failed to resolve channel %s: %s. Make sure you're subscribed to it.",
-                SOURCE_CHANNEL,
-                exc,
-            )
-            raise
+                logger.info("Joined channel %s", SOURCE_CHANNEL)
+            except Exception:
+                # Already a member or cannot join – ignore
+                logger.info("Could not join channel (possibly already joined).")
+        except (ChannelInvalidError, ChannelPrivateError) as exc:
+            logger.error("Cannot resolve/join SOURCE_CHANNEL %s: %s", SOURCE_CHANNEL, exc)
+            return
 
-        logger.info(
-            "Listening as user session '%s' for channel=%s (id=%s), forwarding to chat=%s thread=%s",
-            SESSION_NAME,
-            SOURCE_CHANNEL,
-            channel_entity.id,
-            FORWARD_TO_CHAT_ID,
-            FORWARD_TO_THREAD_ID,
-        )
-
-        # Listen for incoming posts in the channel
-        @client.on(events.NewMessage(chats=channel_entity, incoming=True))
+        @client.on(events.NewMessage(chats=SOURCE_CHANNEL, incoming=True))
         async def handler(event):
-            logger.info(
-                "Received INCOMING message from channel: id=%s, text=%r, is_channel=%s, chat_id=%s",
-                event.message.id,
-                (event.message.message or "")[:100],
-                event.is_channel,
-                event.chat_id,
-            )
-            await process_channel_message(event)
+            try:
+                await process_channel_message(event)
+            except Exception as exc:
+                logger.exception("Error in handler: %s", exc)
 
-        # Some channel posts appear as outgoing for the publishing account
-        @client.on(events.NewMessage(chats=channel_entity, outgoing=True))
-        async def handler_out(event):
-            logger.info(
-                "Received OUTGOING message from channel: id=%s, text=%r, is_channel=%s, chat_id=%s",
-                event.message.id,
-                (event.message.message or "")[:100],
-                event.is_channel,
-                event.chat_id,
-            )
-            await process_channel_message(event)
-
-        # Catch-all debug to ensure nothing slips through
-        @client.on(events.NewMessage())
-        async def debug_handler(event):
-            if event.chat_id == channel_entity.id:
-                logger.info(
-                    "DEBUG catch-all: id=%s, out=%s, in=%s, text=%r",
-                    event.message.id,
-                    event.out,
-                    event.is_channel,
-                    (event.message.message or "")[:100],
-                )
-
-        logger.info("Event handlers registered. Waiting for messages...")
+        logger.info("User forwarder is running. Waiting for messages...")
         await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("User forwarder stopped manually.")
-
+    asyncio.run(main())
