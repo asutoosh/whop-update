@@ -2,7 +2,7 @@
 Forward filtered Telegram messages to a webhook with manual approval.
 
 Requirements:
-    pip install python-telegram-bot==20.7 requests python-dotenv
+    pip install python-telegram-bot>=21.0 requests python-dotenv
 
 Security hardening:
     - Set WEBHOOK_SHARED_SECRET to enable HMAC signatures on outbound payloads.

@@ -7,7 +7,7 @@ The website API handles validation, parsing, and storage.
 Deploy on: Railway, Render, Fly.io, DigitalOcean, or any VPS
 
 Requirements:
-    pip install python-telegram-bot==20.7 requests python-dotenv
+    pip install python-telegram-bot>=21.0 requests python-dotenv
 
 Environment Variables:
     TELEGRAM_BOT_TOKEN=your_bot_token
