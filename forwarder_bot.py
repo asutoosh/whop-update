@@ -68,9 +68,11 @@ WEBHOOK_INCLUDE_META = os.getenv("WEBHOOK_INCLUDE_META", "false").strip().lower(
 REQUIRE_FORWARDED = (
     os.getenv("REQUIRE_FORWARDED", "true").strip().lower() in {"1", "true", "yes"}
 )
-# Whether to include the "script" line in formatted trade output
+# Whether to include the "script" line in formatted trade output.
+# Default is now TRUE so that signal names (symbols) are preserved in all
+# forwarded messages. You can disable it by setting INCLUDE_SCRIPT_LINE=false.
 INCLUDE_SCRIPT_LINE = (
-    os.getenv("INCLUDE_SCRIPT_LINE", "false").strip().lower() in {"1", "true", "yes"}
+    os.getenv("INCLUDE_SCRIPT_LINE", "true").strip().lower() in {"1", "true", "yes"}
 )
 
 # Limit processing to specific chats (comma-separated chat IDs). Leave empty for all.
