@@ -112,7 +112,6 @@ if not BOT_TOKEN:
 # Helpers: parse IDs, allowed lists
 # ---------------------------------------------------------------------------
 
-
 def _parse_int_or_none(value: str) -> Optional[int]:
     value = value.strip()
     if not value:
@@ -121,7 +120,6 @@ def _parse_int_or_none(value: str) -> Optional[int]:
         return int(value)
     except ValueError:
         return None
-
 
 def _parse_chat_id_list(raw: str) -> List[int]:
     if not raw:
@@ -135,7 +133,6 @@ def _parse_chat_id_list(raw: str) -> List[int]:
         if v is not None:
             out.append(v)
     return out
-
 
 def _parse_topics(raw: str) -> List[Tuple[int, int]]:
     """
@@ -157,7 +154,6 @@ def _parse_topics(raw: str) -> List[Tuple[int, int]]:
             out.append((chat_id, thread_id))
     return out
 
-
 ALLOWED_CHAT_IDS = _parse_chat_id_list(ALLOWED_CHAT_IDS_RAW)
 ALLOWED_TOPICS = _parse_topics(ALLOWED_TOPICS_RAW)
 
@@ -175,7 +171,6 @@ APPROVAL_CHAT_ID_INT = _parse_int_or_none(APPROVAL_CHAT_ID)
 # Shared forwarding state (same as forwarder_bot.py)
 # ---------------------------------------------------------------------------
 
-
 def is_forwarding_enabled() -> bool:
     try:
         with open(FORWARD_STATE_FILE, "r", encoding="utf-8") as f:
@@ -187,11 +182,9 @@ def is_forwarding_enabled() -> bool:
         logger.warning("Could not read %s: %s", FORWARD_STATE_FILE, exc)
         return True
 
-
 # ---------------------------------------------------------------------------
 # Freya ingest API
 # ---------------------------------------------------------------------------
-
 
 def call_freya_ingest(message_text: str) -> Dict[str, Any]:
     """
@@ -230,7 +223,6 @@ def call_freya_ingest(message_text: str) -> Dict[str, Any]:
     except Exception as exc:
         logger.exception("❌ Freya ingest request failed: %s", exc)
         return {"success": False, "status": "error", "data": None}
-
 
 def build_signal_text(signal: Dict[str, Any], fallback_text: str) -> str:
     """
@@ -301,8 +293,6 @@ def clean_signal_text(text: str) -> str:
     
     return '\n'.join(cleaned_lines).strip()
 
-
-# NEW FUNCTION 2: Add this
 def is_new_trading_signal(text: str) -> bool:
     """
     Check if message is a NEW trading signal (not a status update).
@@ -321,10 +311,10 @@ def is_new_trading_signal(text: str) -> bool:
     is_status_update = 'position status' in text_lower
     
     return (has_script and has_position and has_entry and has_tp and has_sl) and not is_status_update
+
 # ---------------------------------------------------------------------------
 # Telegram Bot API sending (forwards to groups/topics)
 # ---------------------------------------------------------------------------
-
 
 def send_telegram_message(
     chat_id: int,
@@ -364,7 +354,6 @@ def send_telegram_message(
     except Exception as exc:
         logger.exception("Error sending Telegram message: %s", exc)
 
-
 def forward_to_all_destinations(formatted_text: str) -> None:
     """
     Forward formatted signal text to:
@@ -381,11 +370,9 @@ def forward_to_all_destinations(formatted_text: str) -> None:
     if EXTRA2_CHAT_ID:
         send_telegram_message(EXTRA2_CHAT_ID, formatted_text, EXTRA2_THREAD_ID)
 
-
 # ---------------------------------------------------------------------------
 # Whop / webhook sending
 # ---------------------------------------------------------------------------
-
 
 def send_whop_webhook(
     formatted_text: str,
@@ -444,11 +431,9 @@ def send_whop_webhook(
     except Exception as exc:
         logger.exception("Error sending webhook: %s", exc)
 
-
 # ---------------------------------------------------------------------------
 # Core message processing
 # ---------------------------------------------------------------------------
-
 
 async def process_channel_message(event) -> None:
     message = event.message
@@ -497,25 +482,27 @@ async def process_channel_message(event) -> None:
         )
         return
 
-        if is_valid_signal:
-            logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
+    if is_valid_signal:
+        logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
         
-        # Check if this is a NEW trading signal (not just a status update)
-            if is_new_trading_signal(text):
-                logger.info("Message is a NEW trading signal - forwarding to groups & webhook")
-            
-                # Build formatted text from Freya's parsed signal
-                formatted_text = build_signal_text(signal_obj, text)
-            
-                # Clean the text: remove WAZIR FOREX ALGO header and inquiries footer
-                cleaned_text = clean_signal_text(formatted_text)
-            
-                # Forward cleaned text to Telegram groups & Whop webhook
-                forward_to_all_destinations(cleaned_text)
-                send_whop_webhook(cleaned_text, signal_obj, raw_text=text)
-            else:
-                logger.info("Message is a status update (TP/SL hit) - NOT forwarding to groups/webhook")
-
+        # Clean the raw text (remove WAZIR FOREX ALGO and inquiries footer)
+        cleaned_text = clean_signal_text(text)
+        
+        # If Freya parsed it into a signal object, use formatted version
+        # Otherwise use the cleaned raw text (for TP/SL status updates)
+        if signal_obj and signal_obj.get("symbol"):
+            logger.info("Message has parsed signal data - using formatted version")
+            formatted_text = build_signal_text(signal_obj, text)
+            final_text = clean_signal_text(formatted_text)
+        else:
+            logger.info("Message has no signal data - using cleaned raw text (likely TP/SL update)")
+            final_text = cleaned_text
+        
+        # Forward to all Telegram destinations
+        forward_to_all_destinations(final_text)
+        
+        # Send to Whop/webhook
+        send_whop_webhook(final_text, signal_obj, raw_text=text)
     else:
         logger.info(
             "Message id=%s NOT classified as valid signal by Freya (status=%s).",
@@ -523,11 +510,9 @@ async def process_channel_message(event) -> None:
             ingest_result.get("status"),
         )
 
-
 # ---------------------------------------------------------------------------
 # Main Telethon client
 # ---------------------------------------------------------------------------
-
 
 async def main() -> None:
     print("=" * 60)
@@ -567,7 +552,6 @@ async def main() -> None:
 
         logger.info("User forwarder is running. Waiting for messages...")
         await client.run_until_disconnected()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
