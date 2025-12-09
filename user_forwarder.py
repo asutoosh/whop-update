@@ -272,7 +272,55 @@ def build_signal_text(signal: Dict[str, Any], fallback_text: str) -> str:
 
     return "\n".join(lines)
 
+def clean_signal_text(text: str) -> str:
+    """
+    Clean up signal text by removing:
+    - WAZIR FOREX ALGO header
+    - Any inquiries Dm @... footer
+    """
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        
+        # Skip header
+        if 'WAZIR FOREX' in line_stripped.upper() and 'ALGO' in line_stripped.upper():
+            continue
+            
+        # Skip footer with inquiries
+        if 'inquiries' in line_stripped.lower() and 'Dm' in line_stripped:
+            continue
+        
+        if '@zubarekhan' in line_stripped.lower():
+            continue
+            
+        # Keep the line if it has actual content
+        if line_stripped:
+            cleaned_lines.append(line_stripped)
+    
+    return '\n'.join(cleaned_lines).strip()
 
+
+# NEW FUNCTION 2: Add this
+def is_new_trading_signal(text: str) -> bool:
+    """
+    Check if message is a NEW trading signal (not a status update).
+    New signals have: script, Position, Enter Price, Take Profit, Stoploss
+    """
+    text_lower = text.lower()
+    
+    # Must have these key fields for a NEW signal
+    has_script = 'script' in text_lower and ':' in text
+    has_position = 'position' in text_lower and ('buy' in text_lower or 'sell' in text_lower)
+    has_entry = 'enter price' in text_lower
+    has_tp = 'take profit' in text_lower
+    has_sl = 'stoploss' in text_lower or 'stop loss' in text_lower
+    
+    # If it says "Position Status", it's a status update, not a new signal
+    is_status_update = 'position status' in text_lower
+    
+    return (has_script and has_position and has_entry and has_tp and has_sl) and not is_status_update
 # ---------------------------------------------------------------------------
 # Telegram Bot API sending (forwards to groups/topics)
 # ---------------------------------------------------------------------------
@@ -449,13 +497,25 @@ async def process_channel_message(event) -> None:
         )
         return
 
-    if is_valid_signal:
-        logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
-        formatted_text = build_signal_text(signal_obj, text)
-        # Forward to all Telegram destinations
-        forward_to_all_destinations(formatted_text)
-        # Send to Whop/webhook
-        send_whop_webhook(formatted_text, signal_obj, raw_text=text)
+        if is_valid_signal:
+            logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
+        
+        # Check if this is a NEW trading signal (not just a status update)
+            if is_new_trading_signal(text):
+                logger.info("Message is a NEW trading signal - forwarding to groups & webhook")
+            
+                # Build formatted text from Freya's parsed signal
+                formatted_text = build_signal_text(signal_obj, text)
+            
+                # Clean the text: remove WAZIR FOREX ALGO header and inquiries footer
+                cleaned_text = clean_signal_text(formatted_text)
+            
+                # Forward cleaned text to Telegram groups & Whop webhook
+                forward_to_all_destinations(cleaned_text)
+                send_whop_webhook(cleaned_text, signal_obj, raw_text=text)
+            else:
+                logger.info("Message is a status update (TP/SL hit) - NOT forwarding to groups/webhook")
+
     else:
         logger.info(
             "Message id=%s NOT classified as valid signal by Freya (status=%s).",
