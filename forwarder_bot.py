@@ -1,4 +1,3 @@
-# forwarder_bot.py
 """
 Telegram Bot: Control & Monitoring for Freya/Whop Forwarding
 
@@ -30,6 +29,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
 )
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,72 @@ async def require_admin(update: Update) -> bool:
         return False
     return True
 
+
+# ---------------------------------------------------------------------------
+# Approval callbacks for unknown messages
+# ---------------------------------------------------------------------------
+
+
+async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle approval/denial button clicks from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update):
+        await query.edit_message_text("🚫 You are not authorized to approve messages.")
+        return
+
+    callback_data = query.data or ""
+
+    if callback_data.startswith("approve_"):
+        approval_id = callback_data.replace("approve_", "")
+        try:
+            with open("pending_approvals.json", "r", encoding="utf-8") as f:
+                pending = json.load(f)
+
+            if approval_id in pending:
+                approval_data = pending[approval_id]
+                text = approval_data.get("text", "")
+
+                from user_forwarder import (
+                    forward_to_all_destinations,
+                    send_whop_webhook,
+                    clean_signal_text,
+                )
+
+                cleaned = clean_signal_text(text)
+                forward_to_all_destinations(cleaned)
+                send_whop_webhook(cleaned, {}, text)
+
+                del pending[approval_id]
+                with open("pending_approvals.json", "w", encoding="utf-8") as f:
+                    json.dump(pending, f)
+
+                await query.edit_message_text(
+                    f"✅ Approved and forwarded!\n\nMessage ID: {approval_id}"
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Approval ID {approval_id} not found (may have expired)"
+                )
+        except Exception as exc:
+            await query.edit_message_text(f"❌ Error: {exc}")
+
+    elif callback_data.startswith("deny_"):
+        approval_id = callback_data.replace("deny_", "")
+        try:
+            with open("pending_approvals.json", "r", encoding="utf-8") as f:
+                pending = json.load(f)
+
+            if approval_id in pending:
+                del pending[approval_id]
+                with open("pending_approvals.json", "w", encoding="utf-8") as f:
+                    json.dump(pending, f)
+                await query.edit_message_text(f"❌ Denied!\n\nMessage ID: {approval_id}")
+            else:
+                await query.edit_message_text(f"❌ Approval ID {approval_id} not found")
+        except Exception as exc:
+            await query.edit_message_text(f"❌ Error: {exc}")
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -327,6 +393,7 @@ def main() -> None:
     app.add_handler(CommandHandler("forward_on", forward_on_command))
     app.add_handler(CommandHandler("forward_off", forward_off_command))
     app.add_handler(CommandHandler("forward_status", forward_status_command))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback))
 
     print("\n✅ Bot is running (forwarder_bot.py)")
     print("💡 Commands: /start, /stats, /test, /health, /forward_on, /forward_off, /forward_status\n")

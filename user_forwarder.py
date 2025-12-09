@@ -1,18 +1,11 @@
-# user_forwarder.py
+# user_forwarder.py - WITH APPROVAL SYSTEM
 """
-Userbot watcher for signals:
-- Logs in as a Telegram user (Telethon) using API_ID/API_HASH/USERBOT_SESSION.
+Userbot watcher for signals with approval system:
 - Watches SOURCE_CHANNEL for new messages.
 - For every text message:
-    1) Sends raw text to Freya ingest API (WEBSITE_API_URL + INGEST_API_KEY).
-    2) If ingest says status == 'success':
-        - Forwards formatted text to:
-            * FORWARD_TO_CHAT_ID + FORWARD_TO_THREAD_ID
-            * EXTRA_FORWARD_1_CHAT_ID + EXTRA_FORWARD_1_THREAD_ID
-            * EXTRA_FORWARD_2_CHAT_ID + EXTRA_FORWARD_2_THREAD_ID
-        - Sends payload to Whop WEBHOOK_URL.
-
-Uses the same .env you posted.
+    1) Sends raw text to Freya ingest API
+    2) If Freya recognizes it (status=success) → forwards immediately
+    3) If Freya doesn't recognize it → sends approval request to APPROVAL_CHAT_ID
 """
 
 import asyncio
@@ -20,6 +13,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
 
 import requests
 from dotenv import load_dotenv
@@ -55,7 +49,7 @@ WEBHOOK_URL = os.getenv("WHOP_WEBHOOK_URL", "").strip() or os.getenv(
     "WEBHOOK_URL", ""
 ).strip()
 WEBHOOK_SEND_MODE = os.getenv("WEBHOOK_SEND_MODE", "json").strip().lower()
-WEBHOOK_PAYLOAD_KEY = os.getenv("WEBHOOK_PAYLOAD_KEY", "text").strip()
+WEBHOOK_PAYLOAD_KEY = os.getenv("WEBHOOK_PAYLOAD_KEY", "content").strip()
 WEBHOOK_INCLUDE_META = os.getenv("WEBHOOK_INCLUDE_META", "false").strip().lower() in (
     "1",
     "true",
@@ -92,6 +86,7 @@ WEBSITE_API_URL = os.getenv("WEBSITE_API_URL", "").strip()
 INGEST_API_KEY = os.getenv("INGEST_API_KEY", "").strip()
 
 FORWARD_STATE_FILE = "forward_state.json"
+PENDING_APPROVALS_FILE = "pending_approvals.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -135,9 +130,6 @@ def _parse_chat_id_list(raw: str) -> List[int]:
     return out
 
 def _parse_topics(raw: str) -> List[Tuple[int, int]]:
-    """
-    Format: chat_id:thread_id,chat_id:thread_id
-    """
     if not raw:
         return []
     out: List[Tuple[int, int]] = []
@@ -157,7 +149,7 @@ def _parse_topics(raw: str) -> List[Tuple[int, int]]:
 ALLOWED_CHAT_IDS = _parse_chat_id_list(ALLOWED_CHAT_IDS_RAW)
 ALLOWED_TOPICS = _parse_topics(ALLOWED_TOPICS_RAW)
 
-MAIN_CHAT_ID = _parse_int_or_none(FORWARD_TO_CHAT_ID)  # supergroup
+MAIN_CHAT_ID = _parse_int_or_none(FORWARD_TO_CHAT_ID)
 MAIN_THREAD_ID = _parse_int_or_none(FORWARD_TO_THREAD_ID)
 
 EXTRA1_CHAT_ID = _parse_int_or_none(EXTRA_FORWARD_1_CHAT_ID)
@@ -168,7 +160,50 @@ EXTRA2_THREAD_ID = _parse_int_or_none(EXTRA_FORWARD_2_THREAD_ID)
 APPROVAL_CHAT_ID_INT = _parse_int_or_none(APPROVAL_CHAT_ID)
 
 # ---------------------------------------------------------------------------
-# Shared forwarding state (same as forwarder_bot.py)
+# Pending approvals storage
+# ---------------------------------------------------------------------------
+
+def load_pending_approvals() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(PENDING_APPROVALS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", PENDING_APPROVALS_FILE, exc)
+        return {}
+
+def save_pending_approvals(data: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        with open(PENDING_APPROVALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        logger.error("Could not write %s: %s", PENDING_APPROVALS_FILE, exc)
+
+def add_pending_approval(text: str, signal_obj: Dict[str, Any]) -> str:
+    """Add a message to pending approvals, return approval_id"""
+    approval_id = hashlib.md5(text.encode()).hexdigest()[:12]
+    pending = load_pending_approvals()
+    pending[approval_id] = {
+        "text": text,
+        "signal_obj": signal_obj,
+        "timestamp": asyncio.get_event_loop().time()
+    }
+    save_pending_approvals(pending)
+    return approval_id
+
+def get_pending_approval(approval_id: str) -> Optional[Dict[str, Any]]:
+    pending = load_pending_approvals()
+    return pending.get(approval_id)
+
+def remove_pending_approval(approval_id: str) -> None:
+    pending = load_pending_approvals()
+    if approval_id in pending:
+        del pending[approval_id]
+        save_pending_approvals(pending)
+
+# ---------------------------------------------------------------------------
+# Shared forwarding state
 # ---------------------------------------------------------------------------
 
 def is_forwarding_enabled() -> bool:
@@ -187,10 +222,6 @@ def is_forwarding_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 def call_freya_ingest(message_text: str) -> Dict[str, Any]:
-    """
-    Send raw text to Freya ingest API.
-    Returns dict: {success, status, data}
-    """
     if not WEBSITE_API_URL or not INGEST_API_KEY:
         logger.debug("Freya ingest not configured, skipping.")
         return {"success": False, "status": "not_configured", "data": None}
@@ -225,11 +256,6 @@ def call_freya_ingest(message_text: str) -> Dict[str, Any]:
         return {"success": False, "status": "error", "data": None}
 
 def build_signal_text(signal: Dict[str, Any], fallback_text: str) -> str:
-    """
-    Build a human-readable message for Telegram groups from Freya 'signal' object.
-    Falls back to raw text if needed.
-    Expected fields (if Freya returns them): script, position, entry, takeProfits, stopLoss, etc.
-    """
     if not signal:
         return fallback_text
 
@@ -265,55 +291,36 @@ def build_signal_text(signal: Dict[str, Any], fallback_text: str) -> str:
     return "\n".join(lines)
 
 def clean_signal_text(text: str) -> str:
-    """
-    Clean up signal text by removing:
-    - WAZIR FOREX ALGO header
-    - Any inquiries Dm @... footer
-    """
-    lines = text.split('\n')
+    lines = text.split("\n")
     cleaned_lines = []
-    
+
     for line in lines:
         line_stripped = line.strip()
-        
-        # Skip header
-        if 'WAZIR FOREX' in line_stripped.upper() and 'ALGO' in line_stripped.upper():
+        line_lower = line_stripped.lower()
+
+        # Drop promotional/contact-only lines
+        if "wazir forex" in line_lower and "algo" in line_lower:
             continue
-            
-        # Skip footer with inquiries
-        if 'inquiries' in line_stripped.lower() and 'Dm' in line_stripped:
+        if "inquiries" in line_lower and "dm" in line_lower:
             continue
-        
-        if '@zubarekhan' in line_stripped.lower():
+        if "@zubarekhan" in line_lower:
             continue
-            
-        # Keep the line if it has actual content
+
         if line_stripped:
             cleaned_lines.append(line_stripped)
-    
-    return '\n'.join(cleaned_lines).strip()
 
-def is_new_trading_signal(text: str) -> bool:
+    return "\n".join(cleaned_lines).strip()
+
+
+def should_block_message(text: str) -> bool:
     """
-    Check if message is a NEW trading signal (not a status update).
-    New signals have: script, Position, Enter Price, Take Profit, Stoploss
+    Block only if, after stripping spam lines, nothing meaningful remains.
     """
-    text_lower = text.lower()
-    
-    # Must have these key fields for a NEW signal
-    has_script = 'script' in text_lower and ':' in text
-    has_position = 'position' in text_lower and ('buy' in text_lower or 'sell' in text_lower)
-    has_entry = 'enter price' in text_lower
-    has_tp = 'take profit' in text_lower
-    has_sl = 'stoploss' in text_lower or 'stop loss' in text_lower
-    
-    # If it says "Position Status", it's a status update, not a new signal
-    is_status_update = 'position status' in text_lower
-    
-    return (has_script and has_position and has_entry and has_tp and has_sl) and not is_status_update
+    cleaned = clean_signal_text(text)
+    return cleaned == ""
 
 # ---------------------------------------------------------------------------
-# Telegram Bot API sending (forwards to groups/topics)
+# Telegram Bot API
 # ---------------------------------------------------------------------------
 
 def send_telegram_message(
@@ -321,12 +328,12 @@ def send_telegram_message(
     text: str,
     thread_id: Optional[int] = None,
     parse_mode: str = "HTML",
-) -> None:
+    reply_markup: Optional[Dict] = None,
+) -> Optional[int]:
+    """Returns message_id if successful"""
     if not BOT_TOKEN:
-        logger.warning(
-            "BOT_TOKEN not set, cannot forward to Telegram chat_id=%s", chat_id
-        )
-        return
+        logger.warning("BOT_TOKEN not set, cannot send message")
+        return None
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload: Dict[str, Any] = {
@@ -337,6 +344,8 @@ def send_telegram_message(
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
         resp = requests.post(url, json=payload, timeout=10)
@@ -347,20 +356,42 @@ def send_telegram_message(
                 resp.status_code,
                 resp.text[:200],
             )
+            return None
         else:
-            logger.info(
-                "Forwarded to chat_id=%s thread_id=%s", chat_id, thread_id
-            )
+            data = resp.json()
+            msg_id = data.get("result", {}).get("message_id")
+            logger.info("Sent message to chat_id=%s thread_id=%s msg_id=%s", chat_id, thread_id, msg_id)
+            return msg_id
     except Exception as exc:
         logger.exception("Error sending Telegram message: %s", exc)
+        return None
+
+def send_approval_request(text: str, approval_id: str) -> None:
+    """Send approval request with Allow/Deny buttons"""
+    if not APPROVAL_CHAT_ID_INT:
+        logger.warning("APPROVAL_CHAT_ID not set, cannot send approval request")
+        return
+
+    preview = text[:500] + ("..." if len(text) > 500 else "")
+    
+    message = (
+        f"🔔 <b>New Unknown Message Format</b>\n\n"
+        f"<i>Preview:</i>\n<code>{preview}</code>\n\n"
+        f"Allow forwarding to groups + webhook?"
+    )
+    
+    inline_keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Allow", "callback_data": f"approve_{approval_id}"},
+                {"text": "❌ Deny", "callback_data": f"deny_{approval_id}"}
+            ]
+        ]
+    }
+    
+    send_telegram_message(APPROVAL_CHAT_ID_INT, message, reply_markup=inline_keyboard)
 
 def forward_to_all_destinations(formatted_text: str) -> None:
-    """
-    Forward formatted signal text to:
-    - main group/topic
-    - extra topic 1
-    - extra topic 2
-    """
     if MAIN_CHAT_ID:
         send_telegram_message(MAIN_CHAT_ID, formatted_text, MAIN_THREAD_ID)
 
@@ -371,19 +402,14 @@ def forward_to_all_destinations(formatted_text: str) -> None:
         send_telegram_message(EXTRA2_CHAT_ID, formatted_text, EXTRA2_THREAD_ID)
 
 # ---------------------------------------------------------------------------
-# Whop / webhook sending
+# Whop webhook
 # ---------------------------------------------------------------------------
 
-def send_whop_webhook(
-    formatted_text: str,
-    signal: Optional[Dict[str, Any]],
-    raw_text: str,
-) -> None:
+def send_whop_webhook(formatted_text: str, signal: Optional[Dict[str, Any]], raw_text: str) -> None:
     if not WEBHOOK_URL:
         logger.debug("WEBHOOK_URL not set, skipping webhook.")
         return
 
-    # Build payload
     if WEBHOOK_SEND_MODE == "json":
         payload: Any = {WEBHOOK_PAYLOAD_KEY: formatted_text}
         if WEBHOOK_INCLUDE_META:
@@ -397,19 +423,17 @@ def send_whop_webhook(
         payload = {WEBHOOK_PAYLOAD_KEY: formatted_text}
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data_to_send = payload
-    else:  # "text"
+    else:
         payload = formatted_text
         headers = {"Content-Type": "text/plain"}
         data_to_send = payload
 
-    # Basic optional signature – if you want to implement HMAC on receiver side.
     if WEBHOOK_SHARED_SECRET:
-        # Very simple signature: length+secret; replace with HMAC if you want.
         sig = f"{len(formatted_text)}:{WEBHOOK_SHARED_SECRET}"
         headers[WEBHOOK_SIGNATURE_HEADER] = sig
 
     if WEBHOOK_URL.startswith("http://") and not ALLOW_INSECURE_WEBHOOK:
-        logger.warning("HTTP webhook blocked (ALLOW_INSECURE_WEBHOOK=false). URL=%s", WEBHOOK_URL)
+        logger.warning("HTTP webhook blocked. URL=%s", WEBHOOK_URL)
         return
 
     try:
@@ -421,18 +445,14 @@ def send_whop_webhook(
             resp = requests.post(WEBHOOK_URL, data=data_to_send, headers=headers, timeout=10)
 
         if resp.status_code >= 400:
-            logger.warning(
-                "Webhook call failed: http=%s body=%s",
-                resp.status_code,
-                resp.text[:200],
-            )
+            logger.warning("Webhook failed: http=%s body=%s", resp.status_code, resp.text[:200])
         else:
             logger.info("Webhook sent successfully (status %s)", resp.status_code)
     except Exception as exc:
         logger.exception("Error sending webhook: %s", exc)
 
 # ---------------------------------------------------------------------------
-# Core message processing
+# Message processing
 # ---------------------------------------------------------------------------
 
 async def process_channel_message(event) -> None:
@@ -440,24 +460,18 @@ async def process_channel_message(event) -> None:
     text = message.message or ""
     chat_id = event.chat_id
 
-    logger.info(
-        "New channel message: id=%s chat_id=%s has_text=%s",
-        message.id,
-        chat_id,
-        bool(text.strip()),
-    )
+    logger.info("New channel message: id=%s chat_id=%s has_text=%s", message.id, chat_id, bool(text.strip()))
 
     if not text.strip():
         logger.info("Skipping message id=%s (no text).", message.id)
         return
 
-    # Filters (optional, based on env)
+    if should_block_message(text):
+        logger.info("Skipping message id=%s (blocked by spam filter).", message.id)
+        return
+
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
-        logger.info(
-            "Skipping chat_id=%s (not in ALLOWED_CHAT_IDS %s)",
-            chat_id,
-            ALLOWED_CHAT_IDS,
-        )
+        logger.info("Skipping chat_id=%s (not in ALLOWED_CHAT_IDS)", chat_id)
         return
 
     if REQUIRE_FORWARDED and not (message.fwd_from or getattr(message, "forward", None)):
@@ -472,43 +486,35 @@ async def process_channel_message(event) -> None:
     # 1) Always send raw text to Freya ingest
     ingest_result = call_freya_ingest(text)
 
-    # 2) If Freya says it's a valid signal, forward to destinations & webhook
+    # 2) Check if Freya recognized it
     is_valid_signal = ingest_result.get("success") and ingest_result.get("status") == "success"
     signal_obj: Dict[str, Any] = (ingest_result.get("data") or {}).get("signal", {}) if ingest_result.get("data") else {}
 
     if not is_forwarding_enabled():
-        logger.info(
-            "Forwarding disabled – not sending to Telegram groups or Whop, even if valid signal."
-        )
+        logger.info("Forwarding disabled – not sending anywhere.")
         return
 
     if is_valid_signal:
-        logger.info("Message id=%s classified as VALID signal by Freya.", message.id)
+        # Known format - forward immediately
+        logger.info("Message id=%s classified as VALID signal by Freya - forwarding immediately", message.id)
         
-        # Clean the raw text (remove WAZIR FOREX ALGO and inquiries footer)
         cleaned_text = clean_signal_text(text)
         
-        # If Freya parsed it into a signal object, use formatted version
-        # Otherwise use the cleaned raw text (for TP/SL status updates)
         if signal_obj and signal_obj.get("symbol"):
-            logger.info("Message has parsed signal data - using formatted version")
+            logger.info("Using formatted version")
             formatted_text = build_signal_text(signal_obj, text)
             final_text = clean_signal_text(formatted_text)
         else:
-            logger.info("Message has no signal data - using cleaned raw text (likely TP/SL update)")
+            logger.info("Using cleaned raw text")
             final_text = cleaned_text
         
-        # Forward to all Telegram destinations
         forward_to_all_destinations(final_text)
-        
-        # Send to Whop/webhook
         send_whop_webhook(final_text, signal_obj, raw_text=text)
     else:
-        logger.info(
-            "Message id=%s NOT classified as valid signal by Freya (status=%s).",
-            message.id,
-            ingest_result.get("status"),
-        )
+        # Unknown format - request approval
+        logger.info("Message id=%s NOT recognized by Freya - requesting approval", message.id)
+        approval_id = add_pending_approval(text, signal_obj)
+        send_approval_request(text, approval_id)
 
 # ---------------------------------------------------------------------------
 # Main Telethon client
@@ -516,7 +522,7 @@ async def process_channel_message(event) -> None:
 
 async def main() -> None:
     print("=" * 60)
-    print("🚀 user_forwarder.py (Telethon userbot)")
+    print("🚀 user_forwarder.py (Telethon userbot with approval system)")
     print("=" * 60)
     print(f"👤 Session: {SESSION_NAME}")
     print(f"📺 Source channel: {SOURCE_CHANNEL}")
@@ -525,19 +531,18 @@ async def main() -> None:
     print(f"🎯 Main group: {MAIN_CHAT_ID} thread={MAIN_THREAD_ID}")
     print(f"🎯 Extra1: {EXTRA1_CHAT_ID} thread={EXTRA1_THREAD_ID}")
     print(f"🎯 Extra2: {EXTRA2_CHAT_ID} thread={EXTRA2_THREAD_ID}")
+    print(f"✅ Approval chat: {APPROVAL_CHAT_ID_INT}")
     print("=" * 60)
 
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
     async with client:
-        # Resolve and ensure we joined the channel
         try:
             channel_entity = await client.get_entity(SOURCE_CHANNEL)
             try:
                 await client(JoinChannelRequest(channel_entity))
                 logger.info("Joined channel %s", SOURCE_CHANNEL)
             except Exception:
-                # Already a member or cannot join – ignore
                 logger.info("Could not join channel (possibly already joined).")
         except (ChannelInvalidError, ChannelPrivateError) as exc:
             logger.error("Cannot resolve/join SOURCE_CHANNEL %s: %s", SOURCE_CHANNEL, exc)
