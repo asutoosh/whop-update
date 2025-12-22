@@ -312,6 +312,15 @@ def clean_signal_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def is_any_inquiries_only(text: str) -> bool:
+    """
+    Check if the message is ONLY the 'Any inquiries Dm @zubarekhan01' phrase.
+    Returns True if the entire message (normalized) matches this exact phrase.
+    """
+    normalized = " ".join(text.lower().split()).strip()
+    target_phrase = "any inquiries dm @zubarekhan01"
+    return normalized == target_phrase
+
 def should_block_message(text: str) -> bool:
     """
     Block only if, after stripping spam lines, nothing meaningful remains.
@@ -466,7 +475,11 @@ async def process_channel_message(event) -> None:
         logger.info("Skipping message id=%s (no text).", message.id)
         return
 
-    if should_block_message(text):
+    # Check if this is a footer-only message (special handling)
+    is_footer_only = is_any_inquiries_only(text)
+
+    # For footer-only messages, skip the blocking check (we'll handle them specially)
+    if not is_footer_only and should_block_message(text):
         logger.info("Skipping message id=%s (blocked by spam filter).", message.id)
         return
 
@@ -492,6 +505,14 @@ async def process_channel_message(event) -> None:
 
     if not is_forwarding_enabled():
         logger.info("Forwarding disabled – not sending anywhere.")
+        return
+
+    # Special handling for footer-only messages
+    if is_footer_only:
+        logger.info("Message id=%s is footer-only phrase - replacing with reminder message", message.id)
+        replacement_text = "Make sure to react to the messages! 👍✨"
+        forward_to_all_destinations(replacement_text)
+        send_whop_webhook(replacement_text, signal_obj, raw_text=text)
         return
 
     if is_valid_signal:
